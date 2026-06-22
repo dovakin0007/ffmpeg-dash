@@ -3,8 +3,9 @@ use std::{
 };
 
 use ffmpeg_next::{
-    Codec, Format, Frame, Stream, codec::{Context, Parameters}, decoder::{self, Opened}, ffi::{avformat_close_input, avformat_free_context}, format::{self, Context as FormatContext, Input, Output, context::{input::PacketIter, output::dump}, open}, packet
+    Codec, Format, Frame, Packet, Rounding, Stream, codec::{Context, Parameters}, decoder::{self, Opened}, device::input, format::{self, Context as FormatContext, Flags, Input, Output, context::output::dump, open}, packet
 };
+use ffmpeg_next::util::mathematics::rescale::Rescale;
 
 pub struct CodecCtx {
     open: Opened,
@@ -136,16 +137,19 @@ impl DerefMut for WrappedFrame {
 
 
 
-fn convert_input_streams(opened: DemuxerCtx, output_ctx: format::Context) -> format::context::Output {
-    let input = opened.ctx.input();
-    let mut stream_list = Vec::with_capacity(input.nb_streams() as usize);
-    let mut output: format::context::Output = output_ctx.output();
+fn convert_input_streams(opened: &mut format::context::Input, output_ctx: &mut format::context::Output) -> Vec<i32> {
+    let input = opened;
+    let mut stream_list = vec![-1; input.nb_streams() as usize];
+    let output: &mut format::context::Output = output_ctx;
+    let stream_index = 0;
     for stream in input.streams().into_iter() {
     
         let in_params = stream.parameters();
  
         match in_params.medium() {
             ffmpeg_next::media::Type::Video | ffmpeg_next::media::Type::Audio | ffmpeg_next::media::Type::Subtitle  => {
+            stream_list[stream.index()] = stream_index;
+
             let codec = unsafe {
                 Codec::wrap(null_mut())
             };
@@ -154,13 +158,37 @@ fn convert_input_streams(opened: DemuxerCtx, output_ctx: format::Context) -> for
             op.set_parameters(in_params);
             },
             _ => {
-                stream_list[stream.index()] = -1
             }
         } 
     }
     dump(&output, 0, None);
-    output
+    stream_list
     
+}
+
+
+fn create_format_out(output: &format::context::Output) -> Format {
+    Format::Output(output.format())
+}
+
+fn create_new_file<P: AsRef<Path>>(input: &mut format::context::Input,output_ctx: &mut format::context::Output, path: P) -> Vec<i32> {
+    if (output_ctx.format().flags() & Flags::NO_FILE).bits() == 0 {
+        // let ctx = format::Context::Output(output_ctx);
+        open(&path,&create_format_out(output_ctx)).unwrap();
+    }
+    let stream_index = convert_input_streams(input, output_ctx);
+
+    let mut dict = ffmpeg_next::Dictionary::new();
+    dict.set("movflags", "frag_keyframe+empty_moov+default_base_moof");
+    let dict_ptr = unsafe { dict.as_mut_ptr() };
+    let dict = unsafe {
+        ffmpeg_next::Dictionary::own(dict_ptr)
+    };
+
+    
+    _= output_ctx.write_header_with(dict).unwrap();
+    stream_index
+
 }
 
 pub fn new_output_path<P: AsRef<Path>>(path: &P) -> Result<format::Context, ffmpeg_next::Error> {
@@ -170,5 +198,36 @@ pub fn new_output_path<P: AsRef<Path>>(path: &P) -> Result<format::Context, ffmp
 }
 
 fn main() {
-    println!("Hello, world!");
+    let mut packet = Packet::empty();
+    let mut demuxer = DemuxerCtx::new("./test.mp4").unwrap();
+    
+    let input_ctx: &mut format::context::Input = &mut demuxer.ctx.input();
+    let output = ffmpeg_next::format::Context::Output(unsafe { format::context::Output::wrap(null_mut()) }) ;
+    let output_ctx = &mut output.output();
+    let stream_index_list = create_new_file(input_ctx, output_ctx,"./its_mpd.mpd");
+    let streams_count = input_ctx.nb_streams();
+    'stream: loop {
+        let opt = packet.read(input_ctx);
+        if opt.is_err() {
+            opt.unwrap();
+            break 'stream;
+        }
+        let instream = input_ctx.stream(packet.stream()).unwrap();
+        if packet.stream() >= streams_count as usize || stream_index_list[packet.stream()] < 0 {
+            continue;
+        }
+        packet.set_stream(stream_index_list[packet.stream()].try_into().unwrap());
+        let out_stream = output_ctx.stream(packet.stream()).unwrap();
+        let dts =  packet.dts().unwrap();
+        let new_dts = dts.rescale_with(instream.time_base(), out_stream.time_base(), Rounding::PassMinMax);
+        let pts =packet.pts().unwrap();
+        let new_pts = pts.rescale_with(instream.time_base(), out_stream.time_base(),  Rounding::PassMinMax);
+        let dur = packet.duration();
+        let new_dur = dur.rescale(instream.time_base(), out_stream.time_base());;
+        packet.set_dts(Some(new_dts));
+        packet.set_pts(Some(new_pts));
+        packet.set_duration(new_dur);
+        packet.set_position(-1);
+        packet.write_interleaved(output_ctx).unwrap();
+    };
 }
