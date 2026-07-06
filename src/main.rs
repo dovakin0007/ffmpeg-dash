@@ -8,14 +8,13 @@ use std::{
 };
 
 use ffmpeg_next::{
-    Codec, Format, Frame, Packet, Rounding,
-    codec::{Context, Parameters, codec},
-    decoder::{self, Opened},
-    encoder::encoder,
+    Format, Frame, Packet, Rounding,
+    codec::{Context, Parameters},
+    decoder::{self, Opened, Video},
     ffi::avcodec_parameters_from_context,
     format::{self, Context as FormatContext, Flags, Input, Pixel, context::output::dump, open},
-    media::Type::Video,
     packet,
+    software::scaling,
 };
 
 use ffmpeg_next::{
@@ -283,6 +282,76 @@ fn create_new_file<P: AsRef<Path>>(
     stream_index
 }
 
+fn decode_and_encode_frame(
+    decoder: &mut Video,
+    scaler: &mut scaling::Context,
+    encoder: &mut ffmpeg_next::encoder::video::Video,
+    stream_index_list: &[i32],
+    in_index: usize,
+    output_ctx: &mut format::context::Output,
+) {
+    let mut decoded = ffmpeg_next::util::frame::video::Video::empty();
+    let mut encoded_packet = ffmpeg_next::packet::Packet::empty();
+    while decoder.receive_frame(&mut decoded).is_ok() {
+        let mut new_frame = ffmpeg_next::util::frame::video::Video::empty();
+        scaler.run(&decoded, &mut new_frame).unwrap();
+        println!(
+            "decoded: pts={:?} width={} height={} format={:?}",
+            decoded.pts(),
+            decoded.width(),
+            decoded.height(),
+            decoded.format(),
+        );
+
+        println!(
+            "scaled: pts={:?} width={} height={} format={:?}",
+            new_frame.pts(),
+            new_frame.width(),
+            new_frame.height(),
+            new_frame.format(),
+        );
+        new_frame.set_pts(decoded.pts());
+        encoder.send_frame(&new_frame).unwrap();
+
+        while encoder.receive_packet(&mut encoded_packet).is_ok() {
+            let out_index = stream_index_list[in_index] as usize;
+            encoded_packet.set_stream(out_index);
+
+            let out_stream = output_ctx.stream(encoded_packet.stream()).unwrap();
+            if let Some(dts) = encoded_packet.dts() {
+                encoded_packet.set_dts(Some(dts.rescale_with(
+                    encoder.time_base(),
+                    out_stream.time_base(),
+                    Rounding::PassMinMax,
+                )));
+            }
+            if let Some(pts) = encoded_packet.pts() {
+                encoded_packet.set_pts(Some(pts.rescale_with(
+                    encoder.time_base(),
+                    out_stream.time_base(),
+                    Rounding::PassMinMax,
+                )));
+            }
+
+            encoded_packet.set_duration(
+                encoded_packet
+                    .duration()
+                    .rescale(encoder.time_base(), out_stream.time_base()),
+            );
+
+            encoded_packet.set_position(-1);
+
+            match encoded_packet.write_interleaved(output_ctx) {
+                Ok(_) => {}
+                Err(e) => {
+                    println!("write_interleaved error: {:?}", e);
+                    break;
+                }
+            }
+        }
+    }
+}
+
 fn main() {
     let mut packet = Packet::empty();
     let demuxer = DemuxerCtx::new("./small_bunny_1080p_60fps.mp4").unwrap();
@@ -311,10 +380,11 @@ fn main() {
     let encoder_codec = ffmpeg_next::codec::encoder::find_by_name("h264_mf").unwrap();
     println!("encoder name = {}", encoder_codec.name());
     println!("encoder id = {:?}", encoder_codec.id());
-    let mut encoder = ffmpeg_next::codec::context::Context::new_with_codec(encoder_codec)
-        .encoder()
-        .video()
-        .unwrap();
+    let mut encoder: ffmpeg_next::encoder::video::Video =
+        ffmpeg_next::codec::context::Context::new_with_codec(encoder_codec)
+            .encoder()
+            .video()
+            .unwrap();
 
     encoder.set_width(1280);
     encoder.set_height(720);
@@ -337,7 +407,7 @@ fn main() {
         encoder.set_flags(ffmpeg_next::codec::Flags::GLOBAL_HEADER);
     }
     let mut encoder = encoder.open().unwrap();
-    let output_ctx = &mut output;
+    let output_ctx: &mut format::context::Output = &mut output;
     let stream_index_list = create_new_file(input_ctx, output_ctx, "./its_mpd.mpd", &encoder);
     let streams_count = input_ctx.nb_streams();
     'stream: loop {
@@ -357,68 +427,8 @@ fn main() {
         let instream = input_ctx.stream(in_index).unwrap();
         match instream.parameters().medium() {
             ffmpeg_next::media::Type::Video => {
-                decoder.send_packet(&packet).unwrap();
-                let mut decoded = ffmpeg_next::util::frame::video::Video::empty();
-                let mut encoded_packet = ffmpeg_next::packet::Packet::empty();
-                while decoder.receive_frame(&mut decoded).is_ok() {
-                    let mut new_frame = ffmpeg_next::util::frame::video::Video::empty();
-                    scaler.run(&decoded, &mut new_frame).unwrap();
-                    println!(
-                        "decoded: pts={:?} width={} height={} format={:?}",
-                        decoded.pts(),
-                        decoded.width(),
-                        decoded.height(),
-                        decoded.format(),
-                    );
-
-                    println!(
-                        "scaled: pts={:?} width={} height={} format={:?}",
-                        new_frame.pts(),
-                        new_frame.width(),
-                        new_frame.height(),
-                        new_frame.format(),
-                    );
-                    new_frame.set_pts(decoded.pts());
-                    encoder.send_frame(&new_frame).unwrap();
-
-                    while encoder.receive_packet(&mut encoded_packet).is_ok() {
-                        let out_index = stream_index_list[in_index] as usize;
-                        encoded_packet.set_stream(out_index);
-                        let out_index = stream_index_list[in_index] as usize;
-
-                        let out_stream = output_ctx.stream(encoded_packet.stream()).unwrap();
-                        if let Some(dts) = encoded_packet.dts() {
-                            encoded_packet.set_dts(Some(dts.rescale_with(
-                                encoder.time_base(),
-                                out_stream.time_base(),
-                                Rounding::PassMinMax,
-                            )));
-                        }
-                        if let Some(pts) = encoded_packet.pts() {
-                            encoded_packet.set_pts(Some(pts.rescale_with(
-                                encoder.time_base(),
-                                out_stream.time_base(),
-                                Rounding::PassMinMax,
-                            )));
-                        }
-
-                        encoded_packet.set_duration(
-                            encoded_packet
-                                .duration()
-                                .rescale(encoder.time_base(), out_stream.time_base()),
-                        );
-
-                        encoded_packet.set_position(-1);
-
-                        match encoded_packet.write_interleaved(output_ctx) {
-                            Ok(_) => {}
-                            Err(e) => {
-                                println!("write_interleaved error: {:?}", e);
-                                break;
-                            }
-                        }
-                    }
-                }
+                decoder.send_packet(&packet);
+                decode_and_encode_frame(&mut decoder, &mut scaler, &mut encoder, &stream_index_list, in_index, output_ctx)
             }
             ffmpeg_next::media::Type::Audio | ffmpeg_next::media::Type::Subtitle => {
                 if packet.stream() >= streams_count as usize
