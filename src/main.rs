@@ -2,9 +2,8 @@ use std::{
     ffi::{CString, c_int},
     fs,
     ops::{Deref, DerefMut},
-    path::{Path, PathBuf},
+    path::Path,
     ptr::null_mut,
-    str::FromStr,
 };
 
 use ffmpeg_next::{
@@ -12,7 +11,7 @@ use ffmpeg_next::{
     codec::{Context, Parameters},
     decoder::{self, Opened, Video},
     ffi::avcodec_parameters_from_context,
-    format::{self, Context as FormatContext, Flags, Input, Pixel, context::output::dump, open},
+    format::{self, Context as FormatContext, Flags, Input, context::output::dump, open},
     packet,
     software::scaling,
 };
@@ -21,6 +20,12 @@ use ffmpeg_next::{
     ffi::{AVIO_FLAG_WRITE, avcodec_parameters_copy, avformat_new_stream, avio_open},
     util::mathematics::rescale::Rescale,
 };
+
+pub mod encoder;
+pub mod demuxer;
+pub mod dash;
+pub mod muxer;
+pub mod transcode;
 
 pub fn rename_mpd_tmp() -> std::io::Result<()> {
     for entry in fs::read_dir(".")? {
@@ -109,6 +114,20 @@ impl DemuxerCtx {
         let ctx = open(&path, &format).map_err(|e| format!("error: {}", e.to_string()))?;
 
         Ok(Self { ctx: ctx })
+    }
+}
+
+impl Deref for DemuxerCtx {
+    type Target = FormatContext;
+
+    fn deref(&self) -> &Self::Target {
+        &self.ctx
+    }
+}
+
+impl DerefMut for DemuxerCtx {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.ctx
     }
 }
 
@@ -222,9 +241,6 @@ fn convert_input_streams(
     stream_list
 }
 
-fn create_format_out(output: &format::context::Output) -> Format {
-    Format::Output(output.format())
-}
 
 fn create_new_file<P: AsRef<Path>>(
     input: &mut format::context::Input,
@@ -370,14 +386,14 @@ fn main() {
         decoder.format(),
         decoder.width(),
         decoder.height(),
-        Pixel::YUV420P,
+        decoder.format(),
         1280,
         720,
         ffmpeg_next::software::scaling::Flags::BILINEAR,
     )
     .unwrap();
 
-    let encoder_codec = ffmpeg_next::codec::encoder::find_by_name("h264_mf").unwrap();
+    let encoder_codec: ffmpeg_next::Codec = ffmpeg_next::codec::encoder::find_by_name("h264_mf").unwrap();
     println!("encoder name = {}", encoder_codec.name());
     println!("encoder id = {:?}", encoder_codec.id());
     let mut encoder: ffmpeg_next::encoder::video::Video =
@@ -388,7 +404,7 @@ fn main() {
 
     encoder.set_width(1280);
     encoder.set_height(720);
-    encoder.set_format(Pixel::YUV420P);
+    encoder.set_format(decoder.format());
     let video_stream = input_ctx
         .streams()
         .best(ffmpeg_next::media::Type::Video)
@@ -396,6 +412,7 @@ fn main() {
 
     encoder.set_time_base(video_stream.time_base());
     encoder.set_frame_rate(Some(video_stream.rate()));
+    encoder.set_bit_rate(decoder.bit_rate());
     println!("decoder tb = {:?}", decoder.time_base());
     println!("decoder fr = {:?}", decoder.frame_rate());
     let mut output = ffmpeg_next::format::output("./its_mpd.mpd").unwrap();
@@ -427,7 +444,7 @@ fn main() {
         let instream = input_ctx.stream(in_index).unwrap();
         match instream.parameters().medium() {
             ffmpeg_next::media::Type::Video => {
-                decoder.send_packet(&packet);
+                decoder.send_packet(&packet).unwrap();
                 decode_and_encode_frame(&mut decoder, &mut scaler, &mut encoder, &stream_index_list, in_index, output_ctx)
             }
             ffmpeg_next::media::Type::Audio | ffmpeg_next::media::Type::Subtitle => {
